@@ -16,6 +16,7 @@ import numpy as np
 import matplotlib as mpl
 from mpl_toolkits.axes_grid1.axes_divider import make_axes_locatable
 import matplotlib.pyplot as plt
+from mpi4py import MPI
 from dedalus import public as de
 from .base import DedalusSimulation, Monitor
 
@@ -177,7 +178,6 @@ class NavierStokesDecaying2D(DedalusSimulation):
     def setup_initial_conditions(self, solver, **kwargs):
         x = self.domain.grid(0)
         y = self.domain.grid(1)
-        nx, ny = len(x), len(y[0])
         omega = solver.state['omega']
         psi = solver.state['psi']
 
@@ -185,16 +185,17 @@ class NavierStokesDecaying2D(DedalusSimulation):
         if initial_condition == 'kolmogorov':
             omega['g'], psi['g'] = kolmogorov_flow(x, y, kwargs.get('k', 2), kwargs.get('l', 2))
         elif initial_condition == 'random':
+            nx, ny = self.domain.global_grid_shape(scales=1)
             if nx != ny:
                 raise ValueError('Random initial condition available only on a square domain')
-            psi['g'] = generate_forcing2d(nx, kwargs.get('kf', 20))
+            psi['g'] = generate_forcing2d(psi['g'].shape, kwargs.get('kf', 20))
             omega['g'] = vorticity(psi)['g']
             norm = np.sqrt(energy(omega['g'], psi['g'], x, y))
             psi['g'] = psi['g']/norm
             omega['g'] = omega['g']/norm
         elif initial_condition == 'rest':
-            psi['g'] = np.zeros((nx, ny))
-            omega['g'] = np.zeros((nx, ny))
+            psi['g'] = np.zeros(psi['g'].shape)
+            omega['g'] = np.zeros(omega['g'].shape)
         else:
             raise ValueError('Initial condition unknown')
 
@@ -243,7 +244,7 @@ def wavevectors2d(nn):
     ka2 = ka2+ka2.T
     return ka, ka2
 
-def generate_forcing2d_fourier(size, kf, seed=None):
+def generate_forcing2d_fourier(shape, kf, seed=None):
     """
     Generate a 2D isotropic and homogeneous random field with prescribed correlation length.
     Return the result in Fourier space.
@@ -251,25 +252,26 @@ def generate_forcing2d_fourier(size, kf, seed=None):
     Efficient Python implementation with boolean array indexing.
     size=???
     """
-    nn2 = int(size/2+1)
-    fk = np.zeros((size, nn2), dtype=np.complex64)
-    _, ka2 = wavevectors2d(size)
+    nx = shape[0]
+    ny = int(shape[1]/2+1)
+    fk = np.zeros((nx, ny), dtype=np.complex64)
+    _, ka2 = wavevectors2d(nx)
     np.random.seed(seed)
-    sel = (kf**2 <= ka2[:, :nn2])*(ka2[:, :nn2] <= (kf+1)**2)
+    sel = (kf**2 <= ka2[:, :ny])*(ka2[:, :ny] <= (kf+1)**2)
     indk, indl = sel.nonzero()
-    for k in indk[(indl == 0)*(indk < size/2)]:
+    for k in indk[(indl == 0)*(indk < nx/2)]:
         fk[k, 0] = np.exp(2*np.pi*1j*np.random.random())
-        fk[size-k, 0] = np.conj(fk[k, 0])
+        fk[nx-k, 0] = np.conj(fk[k, 0])
     for k, l in zip(indk[indl > 0], indl[indl > 0]):
         fk[k, l] = np.exp(2*np.pi*1j*np.random.random())
     return fk
 
-def generate_forcing2d(size, kf, method=generate_forcing2d_fourier, seed=None):
+def generate_forcing2d(shape, kf, method=generate_forcing2d_fourier, seed=None):
     """
     Generate a 2D isotropic and homogeneous random field with prescribed correlation length.
     Return the result in real space.
     """
-    return np.fft.irfftn(method(size, kf, seed=seed), norm='ortho')
+    return np.fft.irfftn(method(shape, kf, seed=seed), norm='ortho')
 
 def energy(omega, psi, x, y):
     """
@@ -395,11 +397,12 @@ class NavierStokesForced2D(NavierStokesDecaying2D):
 
         with :math:`\omega=-\Delta \psi` the vorticity, :math:`\psi` the stream function.
         """
+        shape = self.domain.local_grid_shape(scales=1)
+
         def Forcing(*args):
-            size = args[0].value
-            kf = args[1].value
-            ampl = args[2].value
-            return ampl*generate_forcing2d(size, kf)
+            kf = args[0].value
+            ampl = args[1].value
+            return ampl*generate_forcing2d(shape, kf)
 
         def F(*args, domain=self.domain, g=Forcing):
             return de.operators.GeneralFunction(self.domain, layout='g', func=g, args=args)
@@ -410,9 +413,8 @@ class NavierStokesForced2D(NavierStokesDecaying2D):
         problem = de.IVP(self.domain, variables=['omega', 'psi'])
 
         problem.parameters.update({k: v for k, v in self.params.items() if k in ('alpha', 'nu', 'kf', 'ampl')})
-        problem.parameters['size'] = len(self.domain.grid(0))
 
-        problem.add_equation('dt(omega) + alpha*omega -nu*(dx(dx(omega))+dy(dy(omega))) = dx(psi)*dy(omega)-dx(omega)*dy(psi)+ F(size, kf, ampl)')
+        problem.add_equation('dt(omega) + alpha*omega -nu*(dx(dx(omega))+dy(dy(omega))) = dx(psi)*dy(omega)-dx(omega)*dy(psi)+ F(kf, ampl)')
         problem.add_equation('omega+dx(dx(psi))+dy(dy(psi)) = 0', condition="(nx != 0) or (ny != 0)")
         problem.add_equation("psi = 0", condition="(nx == 0) and (ny == 0)")
 
